@@ -1,0 +1,51 @@
+#include <msp430fr6989.h>
+
+#define OVERCURRENT_THRESHOLD 2000  // ADC counts threshold for overcurrent (adjust per your setup)
+
+static void adc_init(void) {
+    // Disable ADC before configuration
+    ADCCTL0 &= ~ADCENC;
+
+    // ADC10CTL0 setup
+    ADCCTL0 = ADCON | ADCMSC | ADCSHT_2;   // Turn on ADC, multiple sample and conversion, sample hold time
+    ADCCTL1 = ADCSHP;                      // Use sampling timer
+    ADCCTL2 = ADCRES_2;                    // 12-bit conversion results
+
+    // ADC input channel setup (example: A0 = P1.0)
+    ADCMCTL0 = ADCINCH_0;                  // Select channel A0 (adjust to your current sensing pin)
+
+    // Configure the pin for ADC input
+    P1SEL0 |= BIT0;
+    P1SEL1 |= BIT0;
+
+    ADCCTL0 |= ADCENC;                     // Enable ADC
+}
+
+static unsigned int adc_read(void) {
+    ADCCTL0 |= ADCENC | ADCSC;             // Start conversion
+    while (ADCCTL1 & ADCBUSY);             // Wait for conversion to complete
+    return ADCMEM0;
+}
+
+int main(void) {
+    WDTCTL = WDTPW | WDTHOLD;  // Stop watchdog timer
+
+    adc_init();
+
+    while(1) {
+        unsigned int adc_value = adc_read();
+
+        if (adc_value > OVERCURRENT_THRESHOLD) {
+            // Overcurrent detected
+            // Implement your safety reaction here (e.g., stop motors, signal fault)
+            // For example: set LEDs, or call a safe shutdown function
+            // Here, just a placeholder:
+            // P1OUT |= BIT0;  // Turn on an LED on P1.0 (change as needed)
+        } else {
+            // Normal operation
+            // P1OUT &= ~BIT0; // Turn off LED
+        }
+
+        __delay_cycles(100000);  // Small delay between reads
+    }
+}
