@@ -1,452 +1,346 @@
 #include <msp430.h>
-    #include <stdint.h>
-    #include "hal_LCD.h"
+#include <stdint.h>
 
-    // NEC Protocol timing constants (1 MHz timer = 1 µs per count)
-    #define NEC_START_MIN   7000
-    #define NEC_START_MAX   11000
-    #define NEC_SPACE_MIN   3000
-    #define NEC_SPACE_MAX   6000
-    #define NEC_BIT_MIN     200
-    #define NEC_BIT_MAX     1000
-    #define NEC_ONE_MIN     1200
-    #define NEC_ONE_MAX     2500
-    #define NEC_ZERO_MIN    200
-    #define NEC_ZERO_MAX    1000
+// --- TIMER B0: 38 kHz Carrier Wave on P2.7/TB0.6 ---
+#define PWM_PERIOD          209     // TB0CCR0 for 38.095 kHz at 8 MHz SMCLK
+#define DUTY_CYCLE_50       104
 
-    // LCD position definitions
-    #ifndef pos1
-    #define pos1 1
-    #define pos2 2
-    #define pos3 3
-    #define pos4 4
-    #define pos5 5
-    #define pos6 6
-    #endif
+// --- TIMER A0: Timing Clock Configuration ---
+// SMCLK (8MHz) / 8 = 1MHz Timer A0 clock.
+#define TA_CLK_DIVIDER      8
+#define T_UNIT              1       // 1 count per 1 microsecond (1 MHz clock)
 
-    // === IR Codes from transmitter (lower 24 bits) ===
-    #define CODE_FORWARD   0x45FF45UL  // Forward
-    #define CODE_BACKWARD  0x46FF00UL  // Backward
-    #define CODE_RIGHT     0x47FF45UL  // Right
-    #define CODE_LEFT      0x48FF45UL  // Left
-    #define CODE_SERVO     0x49FF00UL  // Servo slam command
+// --- NEC Protocol Timings (Standard) ---
+#define NEC_LEADER_PULSE_US 9000
+#define NEC_LEADER_SPACE_US 4500
+#define NEC_BIT_PULSE_US    562
+#define NEC_BIT_SPACE_0_US  562
+#define NEC_BIT_SPACE_1_US  1687
+#define NEC_STOP_PULSE_US   562
 
-    // ===== L298N H-Bridge Configuration =====
-    // Motor A Control (Left Motor)
-    #define MOTOR_A_IN1_PORT    P1OUT
-    #define MOTOR_A_IN1_PIN     BIT5
-    #define MOTOR_A_IN2_PORT    P2OUT
-    #define MOTOR_A_IN2_PIN     BIT4
-    #define MOTOR_A_ENA_PORT    P3OUT
-    #define MOTOR_A_ENA_PIN     BIT3
+// --- NEC Data Configuration ---
+#define NEC_CODE_P33   0xBA45FF45UL
+#define NEC_CODE_P36   0xBA46FF00UL
+#define NEC_CODE_P37   0xBA47FF45UL
+#define NEC_CODE_P22   0xBA48FF45UL
+#define NEC_CODE_P13   0xBA49FF00UL
 
-    // Motor B Control (Right Motor)
-    #define MOTOR_B_IN3_PORT    P2OUT
-    #define MOTOR_B_IN3_PIN     BIT5
-    #define MOTOR_B_IN4_PORT    P2OUT
-    #define MOTOR_B_IN4_PIN     BIT6
-    #define MOTOR_B_ENB_PORT    P3OUT
-    #define MOTOR_B_ENB_PIN     BIT6
+// Global state variables
+volatile uint8_t  g_bit_index = 0;
+volatile uint8_t  g_transmit_active = 0;
+volatile uint32_t g_current_nec_data = NEC_CODE_P33;
 
-    // ===== Servo Configuration =====
-    // Using P2.7 for servo PWM (TB0.6)
-    #define SERVO_PIN           BIT7
-    #define SERVO_PORT_SEL0     P2SEL0
-    #define SERVO_PORT_SEL1     P2SEL1
-    #define SERVO_PORT_DIR      P2DIR
-    #define SERVO_PORT_OUT      P2OUT
+// --- Function Prototypes ---
+void init_pwm_carrier(void);
+void init_timer_a0_timing(void);
+void init_buttons(void);
+void start_pwm_output(void);
+void stop_pwm_output(void);
+void set_timer_a0_delay(uint16_t us);
+void start_nec_transmission(void);
+void debounce_delay(void);
 
-    // Servo PWM parameters (1 MHz timebase)
-    #define SERVO_PWM_PERIOD    20000   // 20ms period (50Hz)
-    #define SERVO_ANGLE_UP      1000    // 0 degrees (starting position)
-    #define SERVO_ANGLE_DOWN    1875    // 125 degrees (ending position)
-    #define SERVO_MOVE_DELAY    1400000 // Delay for servo movement (1.4s)
+// =========================================================================
+//                                   MAIN
+// =========================================================================
+void main(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;
 
-    // Globals
-    volatile uint32_t ir_code = 0;
-    volatile uint8_t ir_ready = 0;
+    // Configure DCO to 8MHz SMCLK (Standard for MSP430FR)
+    CSCTL0_H = CSKEY >> 8;
+    CSCTL1 = DCOFSEL_3 | DCORSEL;
+    CSCTL2 = SELA__VLOCLK | SELS__DCOCLK | SELM__DCOCLK;
+    CSCTL3 = DIVA__1 | DIVS__1 | DIVM__1;
+    CSCTL0_H = 0;
 
-    // Motor speed constants (0-1000 for 1kHz PWM)
-    #define MOTOR_FULL_SPEED    1000
-    #define MOTOR_HALF_SPEED    500
-    #define MOTOR_TURN_FAST     600
-    #define MOTOR_TURN_SLOW     300
+    PM5CTL0 &= ~LOCKLPM5;
 
-    // Motor state tracking
-    typedef enum {
-        MOTOR_STATE_STOPPED,
-        MOTOR_STATE_FORWARD,
-        MOTOR_STATE_BACKWARD,
-        MOTOR_STATE_LEFT,
-        MOTOR_STATE_RIGHT
-    } motor_state_t;
+    init_pwm_carrier();
+    init_timer_a0_timing();
+    init_buttons();
 
-    volatile motor_state_t current_motor_state = MOTOR_STATE_STOPPED;
-    volatile uint8_t servo_moving = 0;
+    // Configure Timer A1 for debounce delay (ACLK source)
+    TA1CCTL0 = CCIE;
 
-    // Function Prototypes
-    void init_motors(void);
-    void init_servo(void);
-    void motor_stop(void);
-    void motor_forward(void);
-    void motor_backward(void);
-    void motor_left(void);
-    void motor_right(void);
-    void set_motor_a_speed(uint16_t speed);
-    void set_motor_b_speed(uint16_t speed);
-    void move_servo(void);
+    __enable_interrupt();
 
-    // LCD display helpers
-    void display_yes(void) {
-        clearLCD();
-        showChar('Y', pos1);
-        showChar('E', pos2);
-        showChar('S', pos3);
+    // Sleep until button pressed
+    while (1)
+    {
+        __bis_SR_register(LPM0_bits | GIE);
+        __no_operation();
     }
+}
 
-    void hexToStr(uint32_t num, char *str) {
-        const char hexChars[] = "0123456789ABCDEF";
-        str[0] = hexChars[(num >> 20) & 0xF];
-        str[1] = hexChars[(num >> 16) & 0xF];
-        str[2] = hexChars[(num >> 12) & 0xF];
-        str[3] = hexChars[(num >> 8)  & 0xF];
-        str[4] = hexChars[(num >> 4)  & 0xF];
-        str[5] = hexChars[num & 0xF];
-        str[6] = '\0';
+// =========================================================================
+//                             INITIALIZATION
+// =========================================================================
+
+void init_pwm_carrier(void)
+{
+    // P2.7 = TB0.6
+    P2SEL0 |= BIT7;
+    P2SEL1 &= ~BIT7;
+    P2DIR  |= BIT7;
+
+    TB0CCR0  = PWM_PERIOD;
+    TB0CCTL6 = OUTMOD_7;
+    TB0CCR6  = DUTY_CYCLE_50;
+
+    TB0CTL = TBSSEL__SMCLK | MC__STOP | TBCLR;
+}
+
+void init_timer_a0_timing(void)
+{
+    // Using ID__8 for 1MHz clock to prevent overflow of 9000 counts
+    TA0CTL  = TASSEL__SMCLK | ID__8 | MC__STOP | TACLR;
+    TA0CCTL0 = CCIE;
+}
+
+void init_buttons(void)
+{
+    // --- Port 3 buttons: P3.3, P3.6, P3.7 ---
+    P3DIR &= ~(BIT3 | BIT6 | BIT7);         // Inputs
+    P3REN |=  (BIT3 | BIT6 | BIT7);         // Enable pull resistors
+    P3OUT |=  (BIT3 | BIT6 | BIT7);         // Pull-up
+    P3IES |=  (BIT3 | BIT6 | BIT7);         // High-to-low edge
+    P3IFG &= ~(BIT3 | BIT6 | BIT7);         // Clear flags
+    P3IE  |=  (BIT3 | BIT6 | BIT7);         // Enable interrupts
+
+    // --- Port 2 button: P2.2 ---
+    P2DIR &= ~BIT2;                         // Input
+    P2REN |=  BIT2;                         // Enable pull resistor
+    P2OUT |=  BIT2;                         // Pull-up
+    P2IES |=  BIT2;                         // High-to-low edge
+    P2IFG &= ~BIT2;                         // Clear flag
+    P2IE  |=  BIT2;                         // Enable interrupt
+
+    // --- Port 1 button: P1.3 ---
+    P1DIR &= ~BIT3;                         // Input
+    P1REN |=  BIT3;                         // Enable pull resistor
+    P1OUT |=  BIT3;                         // Pull-up
+    P1IES |=  BIT3;                         // High-to-low edge
+    P1IFG &= ~BIT3;                         // Clear flag
+    P1IE  |=  BIT3;                         // Enable interrupt
+}
+
+// =========================================================================
+//                           CONTROL FUNCTIONS
+// =========================================================================
+
+void start_pwm_output(void)
+{
+    TB0CTL |= MC__UP;
+}
+
+void stop_pwm_output(void)
+{
+    TB0CTL &= ~MC_3;
+    P2OUT  &= ~BIT7;
+}
+
+void set_timer_a0_delay(uint16_t us)
+{
+    TA0CCR0 = us * T_UNIT;
+    TA0CTL &= ~MC_3;   // Stop timer first
+    TA0R = 0;          // Reset counter
+    TA0CTL |= MC__UP;  // Start timer
+}
+
+void start_nec_transmission(void)
+{
+    if (g_transmit_active)
+        return;
+
+    g_bit_index       = 0;
+    g_transmit_active = 1;
+
+    // Ensure clean state before starting
+    TB0CTL &= ~MC_3;   // Stop PWM if running
+    P2OUT  &= ~BIT7;   // Clear output pin
+    TA0CTL &= ~MC_3;   // Stop timing timer
+    TA0CTL |= TACLR;   // Clear Timer A0
+    TA0R = 0;          // Reset counter
+
+    // Start with the Leader Pulse
+    start_pwm_output();
+    set_timer_a0_delay(NEC_LEADER_PULSE_US);
+}
+
+void debounce_delay(void)
+{
+    // ACLK (32768 Hz) for ~100ms delay: 32768 * 0.1s = 3276
+    TA1CCR0 = 3276;
+    TA1CTL  = TASSEL__ACLK | MC__UP | TACLR;
+
+    // Wait in LPM3 until Timer A1 wakes us up
+    __bis_SR_register(LPM3_bits | GIE);
+
+    // Stop the timer
+    TA1CTL = MC__STOP | TACLR;
+}
+
+// =========================================================================
+//                         INTERRUPT SERVICE ROUTINES
+// =========================================================================
+
+// ===== TIMER0_A0 ISR (NEC Timing) =====
+#if defined(__TI_COMPILER_VERSION__) || defined(__IAR_SYSTEMS_ICC__)
+#pragma vector = TIMER0_A0_VECTOR
+__interrupt void TIMER0_A0_ISR(void)
+#elif defined(__GNUC__)
+void __attribute__ ((interrupt(TIMER0_A0_VECTOR))) TIMER0_A0_ISR(void)
+#else
+#error Compiler not supported!
+#endif
+{
+    TA0CTL &= ~MC_3; // Stop timer
+
+    if (!g_transmit_active)
+        return;
+
+    if (g_bit_index == 0) // Step 0: Leader Pulse complete -> Start Leader Space
+    {
+        stop_pwm_output();
+        set_timer_a0_delay(NEC_LEADER_SPACE_US);
+        g_bit_index++;
     }
+    else if (g_bit_index <= 64) // Steps 1 to 64: Data (32 Pulses / 32 Spaces)
+    {
+        // Transmit LSB first (bit 0 to bit 31)
+        uint8_t bit_num = (g_bit_index - 1) / 2;
 
-    void display_hex(uint32_t num) {
-        char str[7];
-        hexToStr(num, str);
-        showChar(str[0], pos1);
-        showChar(str[1], pos2);
-        showChar(str[2], pos3);
-        showChar(str[3], pos4);
-        showChar(str[4], pos5);
-        showChar(str[5], pos6);
-    }
-
-    // Motor Speed Control
-    void set_motor_a_speed(uint16_t speed) {
-        if (speed > 1000) speed = 1000;
-        TA1CCR1 = speed;
-    }
-
-    void set_motor_b_speed(uint16_t speed) {
-        if (speed > 1000) speed = 1000;
-        TB0CCR2 = speed;
-    }
-
-    // Servo Initialization
-    void init_servo(void) {
-        // Configure P2.7 for PWM output (TB0.6)
-        SERVO_PORT_DIR |= SERVO_PIN;              // Set P2.7 as output
-        SERVO_PORT_SEL0 |= SERVO_PIN;             // Select primary peripheral function
-        SERVO_PORT_SEL1 &= ~SERVO_PIN;            // P2.7 = TB0.6 output
-
-        // Configure Timer B0 CCR6 for PWM
-        TB0CCR0 = SERVO_PWM_PERIOD - 1;           // PWM period 20ms at 1MHz
-        TB0CCR6 = SERVO_ANGLE_UP;                 // Start at up position
-        TB0CCTL6 = OUTMOD_7;                      // CCR6 reset/set mode
-        TB0CTL = TBSSEL__SMCLK | MC__UP | TBCLR;  // SMCLK, up mode, clear timer
-    }
-
-    // Servo Movement Function
-    void move_servo(void) {
-        servo_moving = 1;
-        
-        // Move servo down
-        TB0CCR6 = SERVO_ANGLE_DOWN;
-        __delay_cycles(SERVO_MOVE_DELAY);
-
-        // Move servo back up
-        TB0CCR6 = SERVO_ANGLE_UP;
-        __delay_cycles(SERVO_MOVE_DELAY);
-        
-        servo_moving = 0;
-    }
-
-    // Motor Initialization
-    void init_motors(void) {
-        // Motor A Direction pins
-        P1DIR |= MOTOR_A_IN1_PIN;
-        P2DIR |= MOTOR_A_IN2_PIN;
-        
-        // Motor B Direction pins
-        P2DIR |= MOTOR_B_IN3_PIN;
-        P2DIR |= MOTOR_B_IN4_PIN;
-        
-        // Motor A PWM (P3.3 - TA1.1)
-        P3DIR |= MOTOR_A_ENA_PIN;
-        P3SEL1 |= MOTOR_A_ENA_PIN;
-        P3SEL0 &= ~MOTOR_A_ENA_PIN;
-        
-        // Motor B PWM (P3.6 - TB0.2)
-        P3DIR |= MOTOR_B_ENB_PIN;
-        P3SEL1 |= MOTOR_B_ENB_PIN;
-        P3SEL0 &= ~MOTOR_B_ENB_PIN;
-        
-        // Timer A1 for Motor A PWM
-        TA1CCR0 = 1000;
-        TA1CCR1 = 0;
-        TA1CCTL1 = OUTMOD_7;
-        TA1CTL = TASSEL__SMCLK | MC__UP | TACLR;
-        
-        // Timer B0 for Motor B PWM and Servo
-        // TB0CCR0 already set by init_servo()
-        TB0CCR2 = 0;
-        TB0CCTL2 = OUTMOD_7;
-        TB0CTL = TBSSEL__SMCLK | MC__UP | TBCLR;
-        
-        motor_stop();
-    }
-
-    // Motor Control Functions
-    void motor_stop(void) {
-        MOTOR_A_IN1_PORT &= ~MOTOR_A_IN1_PIN;
-        MOTOR_A_IN2_PORT &= ~MOTOR_A_IN2_PIN;
-        MOTOR_B_IN3_PORT &= ~MOTOR_B_IN3_PIN;
-        MOTOR_B_IN4_PORT &= ~MOTOR_B_IN4_PIN;
-        set_motor_a_speed(0);
-        set_motor_b_speed(0);
-        current_motor_state = MOTOR_STATE_STOPPED;
-    }
-
-    void motor_forward(void) {
-        MOTOR_A_IN1_PORT |= MOTOR_A_IN1_PIN;
-        MOTOR_A_IN2_PORT &= ~MOTOR_A_IN2_PIN;
-        MOTOR_B_IN3_PORT |= MOTOR_B_IN3_PIN;
-        MOTOR_B_IN4_PORT &= ~MOTOR_B_IN4_PIN;
-        set_motor_a_speed(MOTOR_FULL_SPEED);
-        set_motor_b_speed(MOTOR_FULL_SPEED);
-        current_motor_state = MOTOR_STATE_FORWARD;
-    }
-
-    void motor_backward(void) {
-        MOTOR_A_IN1_PORT &= ~MOTOR_A_IN1_PIN;
-        MOTOR_A_IN2_PORT |= MOTOR_A_IN2_PIN;
-        MOTOR_B_IN3_PORT &= ~MOTOR_B_IN3_PIN;
-        MOTOR_B_IN4_PORT |= MOTOR_B_IN4_PIN;
-        set_motor_a_speed(MOTOR_FULL_SPEED);
-        set_motor_b_speed(MOTOR_FULL_SPEED);
-        current_motor_state = MOTOR_STATE_BACKWARD;
-    }
-
-    void motor_left(void) {
-        MOTOR_A_IN1_PORT &= ~MOTOR_A_IN1_PIN;
-        MOTOR_A_IN2_PORT |= MOTOR_A_IN2_PIN;
-        MOTOR_B_IN3_PORT |= MOTOR_B_IN3_PIN;
-        MOTOR_B_IN4_PORT &= ~MOTOR_B_IN4_PIN;
-        set_motor_a_speed(MOTOR_TURN_SLOW);
-        set_motor_b_speed(MOTOR_TURN_FAST);
-        current_motor_state = MOTOR_STATE_LEFT;
-    }
-
-    void motor_right(void) {
-        MOTOR_A_IN1_PORT |= MOTOR_A_IN1_PIN;
-        MOTOR_A_IN2_PORT &= ~MOTOR_A_IN2_PIN;
-        MOTOR_B_IN3_PORT &= ~MOTOR_B_IN3_PIN;
-        MOTOR_B_IN4_PORT |= MOTOR_B_IN4_PIN;
-        set_motor_a_speed(MOTOR_TURN_FAST);
-        set_motor_b_speed(MOTOR_TURN_SLOW);
-        current_motor_state = MOTOR_STATE_RIGHT;
-    }
-
-    // MAIN
-    int main(void) {
-        WDTCTL = WDTPW | WDTHOLD;
-        PM5CTL0 &= ~LOCKLPM5;
-
-        // Status LEDs
-        P4DIR |= BIT2;  // LED for FORWARD
-        P4OUT &= ~BIT2;
-
-        P3DIR |= BIT2;  // LED for BACKWARD
-        P3OUT &= ~BIT2;
-
-        P9DIR |= BIT3;  // LED for RIGHT
-        P9OUT &= ~BIT3;
-
-        P1DIR |= BIT4;  // LED for LEFT
-        P1OUT &= ~BIT4;
-
-        // IR input on P2.0
-        P2DIR &= ~BIT0;
-        P2REN |= BIT0;
-        P2OUT |= BIT0;
-
-        // Initialize LCD
-        Init_LCD();
-        display_yes();
-        __delay_cycles(1000000);
-        clearLCD();
-
-        // Initialize servo first (sets TB0CCR0)
-        init_servo();
-        
-        // Initialize motors (uses TB0CCR2)
-        init_motors();
-
-        // Timer A0 for IR timing
-        TA0CTL = TASSEL__SMCLK | MC__CONTINUOUS | TACLR;
-
-        // IR receiver interrupt
-        P2IES |= BIT0;
-        P2IFG &= ~BIT0;
-        P2IE  |= BIT0;
-
-        __enable_interrupt();
-
-        while (1) {
-            if (ir_ready) {
-                display_hex(ir_code);
-                uint32_t low24 = ir_code & 0x00FFFFFFUL;
-
-                // Turn off all status LEDs initially
-                P4OUT &= ~BIT2;
-                P3OUT &= ~BIT2;
-                P9OUT &= ~BIT3;
-                P1OUT &= ~BIT4;
-
-                if (low24 == CODE_FORWARD) {
-                    // Toggle forward: if already moving forward, stop; otherwise go forward
-                    if (current_motor_state == MOTOR_STATE_FORWARD) {
-                        motor_stop();
-                    } else {
-                        P4OUT |= BIT2;
-                        motor_forward();
-                    }
-                }
-                else if (low24 == CODE_BACKWARD) {
-                    // Toggle backward: if already moving backward, stop; otherwise go backward
-                    if (current_motor_state == MOTOR_STATE_BACKWARD) {
-                        motor_stop();
-                    } else {
-                        P3OUT |= BIT2;
-                        motor_backward();
-                    }
-                }
-                else if (low24 == CODE_RIGHT) {
-                    // Toggle right: if already turning right, stop; otherwise turn right
-                    if (current_motor_state == MOTOR_STATE_RIGHT) {
-                        motor_stop();
-                    } else {
-                        P9OUT |= BIT3;
-                        motor_right();
-                    }
-                }
-                else if (low24 == CODE_LEFT) {
-                    // Toggle left: if already turning left, stop; otherwise turn left
-                    if (current_motor_state == MOTOR_STATE_LEFT) {
-                        motor_stop();
-                    } else {
-                        P1OUT |= BIT4;
-                        motor_left();
-                    }
-                }
-                else if (low24 == CODE_SERVO) {
-                    // Servo command - always execute
-                    P4OUT |= BIT2;  // Forward LED
-                    P9OUT |= BIT3;  // Right LED
-                    
-                    // Execute servo slam (move down then back up)
-                    move_servo();
-                    
-                    // Turn off LEDs after servo completes
-                    P4OUT &= ~BIT2;
-                    P9OUT &= ~BIT3;
-                    
-                    // Don't change motor state - keep doing what it was doing
-                }
-                else {
-                    // Unrecognized code - stop motors and light all LEDs
-                    P4OUT |= BIT2;
-                    P3OUT |= BIT2;
-                    P9OUT |= BIT3;
-                    P1OUT |= BIT4;
-                    motor_stop();
-                }
-
-                // Update LED states based on current motor state
-                if (current_motor_state == MOTOR_STATE_FORWARD) {
-                    P4OUT |= BIT2;
-                } else if (current_motor_state == MOTOR_STATE_BACKWARD) {
-                    P3OUT |= BIT2;
-                } else if (current_motor_state == MOTOR_STATE_RIGHT) {
-                    P9OUT |= BIT3;
-                } else if (current_motor_state == MOTOR_STATE_LEFT) {
-                    P1OUT |= BIT4;
-                }
-
-                ir_ready = 0;
-            }
-            
-            __delay_cycles(1000);
+        if (g_bit_index % 2 != 0) // Odd steps (Pulse)
+        {
+            start_pwm_output();
+            set_timer_a0_delay(NEC_BIT_PULSE_US);
         }
-    }
+        else // Even steps (Space)
+        {
+            stop_pwm_output();
 
-    // PORT 2 ISR (IR RECEIVER)
-    #pragma vector=PORT2_VECTOR
-    __interrupt void Port2_ISR(void) {
-        static uint16_t last_edge = 0;
-        static uint8_t state = 0;
-        static uint8_t bit_count = 0;
-        static uint32_t temp_code = 0;
-
-        uint16_t current_time = TA0R;
-        uint16_t pulse_width = current_time - last_edge;
-        last_edge = current_time;
-
-        if (P2IFG & BIT0) {
-            if (P2IES & BIT0) {
-                switch (state) {
-                    case 1:
-                        if (pulse_width >= NEC_SPACE_MIN && pulse_width <= NEC_SPACE_MAX) {
-                            state = 2;
-                            bit_count = 0;
-                            temp_code = 0;
-                        } else state = 0;
-                        break;
-
-                    case 3:
-                        if (pulse_width >= NEC_ONE_MIN && pulse_width <= NEC_ONE_MAX)
-                            temp_code |= ((uint32_t)1 << bit_count);
-                        else if (pulse_width >= NEC_ZERO_MIN && pulse_width <= NEC_ZERO_MAX)
-                            ;
-                        else
-                            state = 0;
-
-                        bit_count++;
-                        if (bit_count >= 32) {
-                            ir_code = temp_code;
-                            ir_ready = 1;
-                            state = 0;
-                        }
-                        break;
-                }
-                P2IES &= ~BIT0;
-            } else {
-                switch (state) {
-                    case 0:
-                        if (pulse_width >= NEC_START_MIN && pulse_width <= NEC_START_MAX)
-                            state = 1;
-                        break;
-
-                    case 2:
-                        if (pulse_width >= NEC_BIT_MIN && pulse_width <= NEC_BIT_MAX)
-                            state = 3;
-                        else
-                            state = 0;
-                        break;
-                }
-                P2IES |= BIT0;
-            }
-
-            if (pulse_width > 20000) {
-                state = 0;
-                bit_count = 0;
-            }
-
-            P2IFG &= ~BIT0;
+            // Check the value of the bit whose pulse was just sent
+            if (g_current_nec_data & (1UL << bit_num))
+                set_timer_a0_delay(NEC_BIT_SPACE_1_US);
+            else
+                set_timer_a0_delay(NEC_BIT_SPACE_0_US);
         }
+
+        g_bit_index++; // Increment the step counter
     }
+    else if (g_bit_index == 65) // Step 65: Stop Pulse
+    {
+        start_pwm_output();
+        set_timer_a0_delay(NEC_STOP_PULSE_US);
+        g_bit_index++;
+    }
+    else if (g_bit_index == 66) // Step 66: Transmission complete
+    {
+        stop_pwm_output();
+        g_transmit_active = 0;
+        __bic_SR_register_on_exit(LPM0_bits);
+    }
+}
+
+// ===== TIMER1_A0 ISR (Debounce Timer) =====
+#if defined(__TI_COMPILER_VERSION__) || defined(__IAR_SYSTEMS_ICC__)
+#pragma vector=TIMER1_A0_VECTOR
+__interrupt void TIMER1_A0_ISR (void)
+#elif defined(__GNUC__)
+void __attribute__ ((interrupt(TIMER1_A0_VECTOR))) TIMER1_A0_ISR (void)
+#else
+#error Compiler not supported!
+#endif
+{
+    __bic_SR_register_on_exit(LPM3_bits);
+}
+
+// ===== PORT3_ISR (Buttons on P3.3, P3.6, P3.7) =====
+#if defined(__TI_COMPILER_VERSION__) || defined(__IAR_SYSTEMS_ICC__)
+#pragma vector = PORT3_VECTOR
+__interrupt void PORT3_ISR(void)
+#elif defined(__GNUC__)
+void __attribute__ ((interrupt(PORT3_VECTOR))) PORT3_ISR(void)
+#else
+#error Compiler not supported!
+#endif
+{
+    uint8_t flags = P3IFG & (BIT3 | BIT6 | BIT7);
+
+    if (flags & BIT3)
+    {
+        P3IFG &= ~BIT3;
+        P3IE &= ~BIT3;
+        g_current_nec_data = NEC_CODE_P33;
+        start_nec_transmission();
+        debounce_delay();
+        P3IE |= BIT3;
+    }
+    else if (flags & BIT6)
+    {
+        P3IFG &= ~BIT6;
+        P3IE &= ~BIT6;
+        g_current_nec_data = NEC_CODE_P36;
+        start_nec_transmission();
+        debounce_delay();
+        P3IE |= BIT6;
+    }
+    else if (flags & BIT7)
+    {
+        P3IFG &= ~BIT7;
+        P3IE &= ~BIT7;
+        g_current_nec_data = NEC_CODE_P37;
+        start_nec_transmission();
+        debounce_delay();
+        P3IE |= BIT7;
+    }
+
+    __bic_SR_register_on_exit(LPM0_bits);
+}
+
+// ===== PORT2_ISR (Button on P2.2) =====
+#if defined(__TI_COMPILER_VERSION__) || defined(__IAR_SYSTEMS_ICC__)
+#pragma vector = PORT2_VECTOR
+__interrupt void PORT2_ISR(void)
+#elif defined(__GNUC__)
+void __attribute__ ((interrupt(PORT2_VECTOR))) PORT2_ISR(void)
+#else
+#error Compiler not supported!
+#endif
+{
+    if (P2IFG & BIT2)
+    {
+        P2IFG &= ~BIT2;
+        P2IE &= ~BIT2;
+        g_current_nec_data = NEC_CODE_P22;
+        start_nec_transmission();
+        debounce_delay();
+        P2IE |= BIT2;
+    }
+
+    __bic_SR_register_on_exit(LPM0_bits);
+}
+
+// ===== PORT1_ISR (Button on P1.3) =====
+#if defined(__TI_COMPILER_VERSION__) || defined(__IAR_SYSTEMS_ICC__)
+#pragma vector = PORT1_VECTOR
+__interrupt void PORT1_ISR(void)
+#elif defined(__GNUC__)
+void __attribute__ ((interrupt(PORT1_VECTOR))) PORT1_ISR(void)
+#else
+#error Compiler not supported!
+#endif
+{
+    if (P1IFG & BIT3)
+    {
+        P1IFG &= ~BIT3;
+        P1IE &= ~BIT3;
+        g_current_nec_data = NEC_CODE_P13;
+        start_nec_transmission();
+        debounce_delay();
+        P1IE |= BIT3;
+    }
+
+    __bic_SR_register_on_exit(LPM0_bits);
+}
